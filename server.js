@@ -716,7 +716,7 @@ app.delete('/api/support/live-chat/:chatId', checkAuth, asyncHandler(async (req,
 
     await session.deleteOne();
     res.status(200).json({ message: 'Chat session deleted successfully.' });
-});
+}));
 
 app.delete('/api/support/live-chat/:chatId/message/:messageId', checkAuth, asyncHandler(async (req, res) => {
     const { chatId, messageId } = req.params;
@@ -814,7 +814,7 @@ adminRouter.post('/tickets/:id/status', asyncHandler(async (req, res) => {
     }).save();
 
     res.json({ message: 'Ticket status updated successfully.' });
-});
+}));
 
 adminRouter.post('/broadcast', asyncHandler(async (req, res) => {
     const { title, message } = req.body;
