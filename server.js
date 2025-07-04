@@ -59,7 +59,7 @@ const SubscriptionSchema = new mongoose.Schema({
     renewalDate: { type: Date },
     declineReason: { type: String },
     history: [{ type: { type: String, required: true }, details: String, date: { type: Date, default: Date.now }, amount: Number, receiptNumber: String, planName: String, }],
-    proofOfPayment: { type: String },
+    proofOfPayment: { type: String, default: null } 
 }, { timestamps: true });
 const BillSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, subscriptionId: { type: String, ref: 'Subscription', required: true }, planName: String, amount: Number, statementDate: { type: Date, default: Date.now }, dueDate: Date, status: { type: String, enum: ['Due', 'Paid', 'Overdue'], default: 'Due' }, paymentDate: Date, }, { timestamps: true });
 const FeedbackSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, userName: String, userPhotoUrl: String, rating: { type: Number, required: true }, text: { type: String, required: true }, }, { timestamps: true });
