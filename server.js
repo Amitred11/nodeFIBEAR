@@ -707,7 +707,7 @@ app.get('/api/support/live-chat/:chatId/listen', checkAuth, asyncHandler(async (
         changeStream.close();
         res.end();
     });
-});
+}));
 
 app.delete('/api/support/live-chat/:chatId', checkAuth, asyncHandler(async (req, res) => {
     const { chatId } = req.params;
