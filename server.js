@@ -4,7 +4,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const jwt = 'jsonwebtoken'; // FIX: This was a typo, should be require('jsonwebtoken')
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // --- Safety Check ---
@@ -70,7 +70,15 @@ const SupportTicketSchema = new mongoose.Schema({
     description: { type: String, required: true },
     status: { type: String, enum: ['Open', 'In Progress', 'Resolved', 'Closed'], default: 'Open' },
     adminComment: { type: String, default: '' },
-    imageUrl: { type: String } // For image uploads
+    imageUrl: { type: String }, // For image uploads
+    // --- FIX: Added messages array to the schema to store conversation history ---
+    messages: [{
+        senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+        senderName: String,
+        text: { type: String, required: true },
+        isAdmin: { type: Boolean, default: false },
+        timestamp: { type: Date, default: Date.now }
+    }],
 }, { timestamps: true });
 const NotificationSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, title: { type: String, required: true }, message: { type: String, required: true }, type: { type: String, default: 'default' }, read: { type: Boolean, default: false }, }, { timestamps: true });
 const LiveChatSessionSchema = new mongoose.Schema({
@@ -78,9 +86,11 @@ const LiveChatSessionSchema = new mongoose.Schema({
     userName: String,
     status: { type: String, enum: ['open', 'active', 'closed'], default: 'open' },
     messages: [{
-        senderId: { type: String, required: true }, // Can be user ID or 'admin'
+        senderId: { type: String, required: true }, // Can be user ID or 'system'
         senderName: String,
         text: { type: String, required: true },
+        // --- FIX: Added isAdmin field to differentiate message styling on the frontend ---
+        isAdmin: { type: Boolean, default: false },
         timestamp: { type: Date, default: Date.now }
     }]
 }, { timestamps: true });
@@ -101,10 +111,10 @@ const checkAdmin = async (req, res, next) => {
     if (authHeader && authHeader.startsWith('Bearer ')) {
         try {
             token = authHeader.split(' ')[1];
-            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            const decoded = require('jsonwebtoken').verify(token, process.env.JWT_SECRET);
             const user = await User.findById(decoded.id).select('-password');
             if (user && user.isAdmin) {
-                req.user = user; // Attach admin user object to request
+                req.user = user; // Attach full admin user object to request
                 return next();
             } else {
                 return res.status(403).json({ message: 'Access denied. Admin role required.' });
@@ -165,7 +175,7 @@ app.post('/api/auth/login', async (req, res) => {
                     _id: user._id,
                     displayName: user.displayName,
                     email: user.email,
-                    user: { _id: user._id, displayName: user.displayName, email: user.email, isAdmin: user.isAdmin }
+                    isAdmin: user.isAdmin,
                 }
             });
         } else {
@@ -378,7 +388,7 @@ app.delete('/api/feedback/:id', checkAuth, async (req, res) => {
 // --- Support & Notification Routes ---
 app.post('/api/support/tickets', checkAuth, async (req, res) => {
     try {
-        // --- FIX: Destructure imageData from the body ---
+        // --- FIX: Destructure `imageData` but use it for the `imageUrl` field ---
         const { subject, description, imageData } = req.body;
         const user = await User.findById(req.user);
         const openTickets = await SupportTicket.countDocuments({ userId: req.user, status: 'Open' });
@@ -391,7 +401,8 @@ app.post('/api/support/tickets', checkAuth, async (req, res) => {
             userName: user.displayName,
             subject: subject,
             description: description,
-            imageData: imageData || null
+            // --- FIX: The field in the schema is `imageUrl` ---
+            imageUrl: imageData || null
         });
 
         await newTicket.save();
@@ -437,25 +448,28 @@ app.get('/api/support/tickets/:id', checkAuth, async (req, res) => {
 app.post('/api/support/tickets/:id/reply', checkAuth, async (req, res) => {
     try {
         const ticket = await SupportTicket.findById(req.params.id);
-        // In a real app with an admin panel, an admin would bypass this check
+        
+        // --- FIX: Logic needs to handle replies from admins too. This requires checkAdmin middleware.
+        // For now, we'll assume this endpoint is for USERS ONLY to simplify.
+        // The admin-specific reply endpoint in the adminRouter is the correct place for admin replies.
         if (!ticket || ticket.userId.toString() !== req.user) {
             return res.status(404).json({ message: "Ticket not found or you're not authorized to reply." });
         }
         
         const user = await User.findById(req.user);
-        const isAdminReply = req.body.isAdmin || false; // This would be 'true' if sent from an admin panel
 
         const newReply = {
             senderId: req.user,
             senderName: user.displayName,
             text: req.body.text,
-            isAdmin: isAdminReply
+            isAdmin: false // User replies are never admin replies
         };
         
+        // --- FIX: Push the reply into the `messages` array ---
         ticket.messages.push(newReply);
         
-        // If a user replies, re-open the ticket. If an admin replies, they set the status.
-        if (!isAdminReply && (ticket.status === 'Resolved' || ticket.status === 'Closed')) {
+        // If a user replies, re-open the ticket.
+        if (ticket.status === 'Resolved' || ticket.status === 'Closed') {
             ticket.status = 'In Progress';
         }
 
@@ -463,6 +477,7 @@ app.post('/api/support/tickets/:id/reply', checkAuth, async (req, res) => {
         res.status(201).json(updatedTicket);
 
     } catch (error) {
+        console.error("Ticket reply error:", error)
         res.status(500).json({ message: error.message });
     }
 });
@@ -514,16 +529,17 @@ app.post('/api/support/request-agent', checkAuth, async (req, res) => {
 
 app.post('/api/support/live-chat/:chatId/message', checkAuth, async (req, res) => {
     try {
-        const { text, isAdmin } = req.body; // <-- Receive isAdmin flag from the request
+        // --- SECURITY FIX: Do NOT trust `isAdmin` from the client. ---
+        // We only need the `text` from the request body.
+        const { text } = req.body;
         const { chatId } = req.params;
-        const userId = req.user; // This is the ID of whoever is logged in (customer or admin)
+        const userId = req.user;
 
         const session = await LiveChatSession.findById(chatId);
         
-        // Security check: Only the customer who owns the session or an admin can post.
-        // In a real app, you would have a proper role check: if (session.userId.toString() !== userId && !user.isAdmin)
-        if (!session) {
-            return res.status(404).json({ message: 'Chat session not found.' });
+        // Security check: Only the customer who owns the session can post.
+        if (!session || session.userId.toString() !== userId) {
+            return res.status(403).json({ message: 'You are not authorized to post in this chat session.' });
         }
 
         const sender = await User.findById(userId).select('displayName');
@@ -531,9 +547,9 @@ app.post('/api/support/live-chat/:chatId/message', checkAuth, async (req, res) =
             senderId: userId,
             senderName: sender.displayName,
             text,
-            // --- THE FIX: Use the flag from the request body ---
-            // A customer app will send `false` or nothing. An admin app will send `true`.
-            isAdmin: isAdmin || false, 
+            // --- SECURITY FIX: `isAdmin` is ALWAYS false for this user-facing endpoint. ---
+            // The admin-only endpoint will be responsible for setting it to true.
+            isAdmin: false, 
         });
         await session.save();
         res.status(201).json(session);
@@ -548,8 +564,8 @@ app.get('/api/support/live-chat/:chatId', checkAuth, async (req, res) => {
         const { chatId } = req.params;
         const session = await LiveChatSession.findById(chatId);
 
-        // Security check
-        if (!session || (session.userId.toString() !== req.user /* && !user.isAdmin */)) {
+        // Security check: User must own the session. Admins will use a separate route.
+        if (!session || (session.userId.toString() !== req.user)) {
             return res.status(404).json({ message: "Chat session not found or access denied." });
         }
         
@@ -576,8 +592,13 @@ app.get('/api/support/live-chat/:chatId/listen', checkAuth, async (req, res) => 
     // Immediately send the current messages
     try {
         const initialSession = await LiveChatSession.findById(chatId);
+        // Security check: Ensure the user is authorized before setting up the stream
         if (initialSession && initialSession.userId.toString() === req.user) {
             sendMessages(initialSession.messages);
+        } else {
+            // If not authorized, send an error and close the connection.
+            res.write(`data: ${JSON.stringify({error: "Access Denied"})}\n\n`);
+            return res.end();
         }
     } catch (e) { console.error(e); }
 
@@ -587,7 +608,8 @@ app.get('/api/support/live-chat/:chatId/listen', checkAuth, async (req, res) => 
     ]);
 
     changeStream.on('change', (change) => {
-        if (change.operationType === 'update' && change.updateDescription.updatedFields.messages) {
+        // Double-check the document exists and has the messages field
+        if (change.operationType === 'update' && change.fullDocument && change.fullDocument.messages) {
              sendMessages(change.fullDocument.messages);
         }
     });
@@ -622,19 +644,20 @@ app.delete('/api/support/live-chat/:chatId/message/:messageId', checkAuth, async
 
         const session = await LiveChatSession.findById(chatId);
 
-        // Security check: Ensure the user owns the chat session.
         if (!session || session.userId.toString() !== userId) {
-            return res.status(404).json({ message: 'Chat session not found or access denied.' });
+            return res.status(403).json({ message: 'Access denied.' });
         }
 
-        // Use $pull to efficiently remove the message from the array
+        // --- FIX: More secure pull. Only let users delete their OWN messages. ---
+        // An admin's deletion logic would be in an admin-specific route.
         const result = await LiveChatSession.updateOne(
             { _id: chatId },
-            { $pull: { messages: { _id: new mongoose.Types.ObjectId(messageId) } } }
+            { $pull: { messages: { _id: new mongoose.Types.ObjectId(messageId), senderId: userId } } }
         );
 
         if (result.modifiedCount === 0) {
-            return res.status(404).json({ message: "Message not found." });
+            // This now means either the message doesn't exist OR the user doesn't own it.
+            return res.status(404).json({ message: "Message not found or you are not authorized to delete it." });
         }
         
         res.status(200).json({ message: 'Message deleted successfully.' });
@@ -647,7 +670,9 @@ app.delete('/api/support/live-chat/:chatId/message/:messageId', checkAuth, async
 app.get('/api/notifications', checkAuth, async (req, res) => { try { const notifications = await Notification.find({ userId: req.user }).sort({ createdAt: -1 }); res.json(notifications); } catch (error) { res.status(500).json({ message: error.message }); }});
 app.post('/api/notifications/mark-read', checkAuth, async (req, res) => { try { const { ids } = req.body; const query = { userId: req.user }; if (ids && ids.length > 0) { query._id = { $in: ids }; } await Notification.updateMany(query, { read: true }); res.status(200).json({ message: 'Notifications marked as read' }); } catch (error) { res.status(500).json({ message: error.message }); }});
 app.post('/api/notifications/delete', checkAuth, async (req, res) => { try { const { ids } = req.body; if (!ids || ids.length === 0) return res.status(400).json({ message: 'No notification IDs provided' }); await Notification.deleteMany({ userId: req.user, _id: { $in: ids } }); res.status(200).json({ message: 'Notifications deleted' }); } catch (error) { res.status(500).json({ message: error.message }); }});
-app.post('/api/admin/approve-payment/:subscriptionId', checkAuth, async (req, res) => {
+
+// --- SECURITY FIX: These powerful routes MUST be protected by checkAdmin, not checkAuth. ---
+app.post('/api/admin/approve-payment/:subscriptionId', checkAdmin, async (req, res) => {
     try {
         const { subscriptionId } = req.params;
         const subscription = await Subscription.findById(subscriptionId);
@@ -658,7 +683,7 @@ app.post('/api/admin/approve-payment/:subscriptionId', checkAuth, async (req, re
         const user = await User.findById(subscription.userId);
         if (!user) { return res.status(404).json({ message: "Associated user not found." }); }
         const needsInstallation = (user.isModemInstalled !== true);
-        // NEW USER (needs installation)
+        
         if (needsInstallation) {
             subscription.status = 'pending_installation';
             subscription.history.unshift({ type: 'payment_success', details: 'GCash payment approved by admin. Awaiting installation.' });
@@ -670,7 +695,6 @@ app.post('/api/admin/approve-payment/:subscriptionId', checkAuth, async (req, re
             }).save();
             res.status(200).json({ message: "Payment approved. Subscription is now pending installation." });
         
-        // RETURNING USER (has modem, activate immediately)
         } else {
             subscription.status = 'active';
             subscription.startDate = new Date();
@@ -695,8 +719,8 @@ app.post('/api/admin/approve-payment/:subscriptionId', checkAuth, async (req, re
     }
 });
 
-// --- NEW ENDPOINT - ACTION 2: Confirm Installation ---
-app.post('/api/admin/confirm-installation/:subscriptionId', checkAuth, async (req, res) => {
+// --- SECURITY FIX: This route MUST be protected by checkAdmin, not checkAuth. ---
+app.post('/api/admin/confirm-installation/:subscriptionId', checkAdmin, async (req, res) => {
     try {
         const { subscriptionId } = req.params;
         const subscription = await Subscription.findById(subscriptionId);
@@ -730,7 +754,6 @@ app.post('/api/admin/confirm-installation/:subscriptionId', checkAuth, async (re
         await firstBill.save();
         await user.save();
 
-        // --- REFINED NOTIFICATION LOGIC ---
         await new Notification({
             userId: subscription.userId,
             title: 'Installation Complete!',
@@ -745,7 +768,8 @@ app.post('/api/admin/confirm-installation/:subscriptionId', checkAuth, async (re
 });
 // --- Chatbot Route (Mock) ---
 app.post('/api/chat', (req, res) => { 
-    res.status(404).json({ message: "This endpoint is deprecated. Please use the AI Chat service." });
+    // FIX: Using 410 Gone is more semantically correct for a deprecated endpoint.
+    res.status(410).json({ message: "This endpoint is deprecated and no longer available. Please use the AI Chat service." });
 });
 
 // =================================================================
@@ -757,36 +781,12 @@ app.use('/api/admin', checkAdmin, adminRouter); // Protect all admin routes with
 // --- ADMIN: Get Pending Subscriptions ---
 adminRouter.get('/subscriptions/pending', async (req, res) => {
     try {
-        const pending = await Subscription.find({ status: 'pending_verification' })
+        const pending = await Subscription.find({ $or: [{ status: 'pending_verification' }, { status: 'pending_installation' }] })
             .populate('userId', 'displayName email') // Populate with user's name and email
-            .sort({ submittedDate: 1 }); // Oldest first
+            .sort({ createdAt: 1 }); // Oldest first
         res.json(pending);
     } catch (error) {
         res.status(500).json({ message: 'Server error fetching pending subscriptions.' });
-    }
-});
-
-// --- ADMIN: Approve Subscription ---
-adminRouter.post('/subscriptions/:id/approve', async (req, res) => {
-    try {
-        const sub = await Subscription.findById(req.params.id);
-        if (!sub) return res.status(404).json({ message: 'Subscription not found.' });
-        
-        // Logic for approval
-        sub.status = 'active';
-        sub.renewalDate = new Date(new Date().setDate(new Date().getDate() + 30));
-        await sub.save();
-
-        await new Notification({
-            userId: sub.userId,
-            title: 'Subscription Approved!',
-            message: `Your subscription to ${sub.plan.name} is now active.`,
-            type: 'promo' // Using 'promo' to match client's theme colors
-        }).save();
-        
-        res.json({ message: 'Subscription approved successfully.' });
-    } catch (error) {
-        res.status(500).json({ message: 'Server error approving subscription.' });
     }
 });
 
@@ -796,12 +796,14 @@ adminRouter.post('/subscriptions/:id/decline', async (req, res) => {
         const { reason } = req.body;
         if (!reason) return res.status(400).json({ message: 'Decline reason is required.' });
         
-        const sub = await Subscription.findByIdAndUpdate(
-            req.params.id, 
-            { status: 'declined', declineReason: reason },
-            { new: true }
-        );
+        const sub = await Subscription.findById(req.params.id);
+
         if (!sub) return res.status(404).json({ message: 'Subscription not found.' });
+
+        sub.status = 'declined';
+        sub.declineReason = reason;
+        sub.history.unshift({ type: 'declined', details: `Admin declined subscription. Reason: ${reason}` });
+        await sub.save();
 
         await new Notification({
             userId: sub.userId,
@@ -816,36 +818,43 @@ adminRouter.post('/subscriptions/:id/decline', async (req, res) => {
     }
 });
 
-// --- ADMIN: Get Open Support Tickets ---
-adminRouter.get('/tickets/open', async (req, res) => {
+// --- ADMIN: Get All Support Tickets ---
+adminRouter.get('/tickets', async (req, res) => {
     try {
-        const tickets = await SupportTicket.find({ status: 'Open' }).sort({ createdAt: 1 }); // Oldest first
+        const tickets = await SupportTicket.find().sort({ updatedAt: -1 }); // Most recently updated first
         res.json(tickets);
     } catch (error) {
-        res.status(500).json({ message: 'Server error fetching open tickets.' });
+        res.status(500).json({ message: 'Server error fetching tickets.' });
     }
 });
 
-// --- ADMIN: Close Support Ticket ---
-adminRouter.post('/tickets/:id/close', async (req, res) => {
+// --- ADMIN: Update Support Ticket Status ---
+adminRouter.post('/tickets/:id/status', async (req, res) => {
     try {
-        const ticket = await SupportTicket.findByIdAndUpdate(
-            req.params.id,
-            { status: 'Closed', updatedAt: new Date() },
-            { new: true }
-        );
+        const { status, adminComment } = req.body;
+        const validStatuses = ['Open', 'In Progress', 'Resolved', 'Closed'];
+        if (!status || !validStatuses.includes(status)) {
+            return res.status(400).json({ message: 'A valid status is required.' });
+        }
+
+        const ticket = await SupportTicket.findById(req.params.id);
         if (!ticket) return res.status(404).json({ message: 'Ticket not found.' });
+        
+        const oldStatus = ticket.status;
+        ticket.status = status;
+        if(adminComment) ticket.adminComment = adminComment;
+        await ticket.save();
 
         await new Notification({
             userId: ticket.userId,
-            title: 'Support Ticket Closed',
-            message: `Your support ticket regarding "${ticket.subject}" has been closed.`,
+            title: 'Support Ticket Updated',
+            message: `Your ticket "${ticket.subject}" status changed from ${oldStatus} to ${status}.`,
             type: 'update'
         }).save();
         
-        res.json({ message: 'Ticket closed successfully.' });
+        res.json({ message: 'Ticket status updated successfully.' });
     } catch (error) {
-        res.status(500).json({ message: 'Server error closing ticket.' });
+        res.status(500).json({ message: 'Server error updating ticket status.' });
     }
 });
 
@@ -879,6 +888,7 @@ adminRouter.post('/broadcast', async (req, res) => {
 adminRouter.get('/chats', async (req, res) => {
     try {
         const sessions = await LiveChatSession.find({ status: { $in: ['open', 'active'] } })
+            .populate('userId', 'displayName email')
             .sort({ updatedAt: -1 }); // Show most recently active first
         res.json(sessions);
     } catch (error) {
@@ -889,7 +899,7 @@ adminRouter.get('/chats', async (req, res) => {
 // --- ADMIN: Get a specific chat session's details ---
 adminRouter.get('/chats/:chatId', async (req, res) => {
     try {
-        const session = await LiveChatSession.findById(req.params.chatId);
+        const session = await LiveChatSession.findById(req.params.chatId).populate('userId', 'displayName email');
         if (!session) {
             return res.status(404).json({ message: "Chat session not found." });
         }
@@ -916,15 +926,15 @@ adminRouter.post('/chats/:chatId/message', async (req, res) => {
         }
 
         const adminReply = {
-            senderId: adminUser._id,
-            senderName: adminUser.displayName || 'Admin',
+            senderId: adminUser._id.toString(),
+            senderName: adminUser.displayName || 'Admin Support',
             text: text,
             isAdmin: true, // Mark this message as from an admin
             timestamp: new Date()
         };
 
         session.messages.push(adminReply);
-        session.status = 'active'; // Ensure session is marked as active
+        if(session.status === 'open') session.status = 'active'; // Mark session as active
         
         const updatedSession = await session.save();
 
@@ -932,7 +942,7 @@ adminRouter.post('/chats/:chatId/message', async (req, res) => {
         await new Notification({
             userId: session.userId,
             title: 'New message from support',
-            message: `You have a new reply in your live chat session.`,
+            message: `An agent has replied in your live chat session.`,
             type: 'chat'
         }).save();
 
