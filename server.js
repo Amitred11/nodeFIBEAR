@@ -11,13 +11,13 @@ const rateLimit = require('express-rate-limit'); // Import rateLimit
 const mongoSanitize = require('express-mongo-sanitize');
 const hpp = require('hpp');
 const xss = require('xss-clean');
-const multer = require('multer'); // For file upload security
+const multer = require('multer'); // Import multer
 const path = require('path'); // For serving static content securely
 
 // --- Safety Check ---
 if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
-    console.error('FATAL ERROR: JWT_SECRET or REFRESH_TOKEN_SECRET is not defined in the .env file.');
-    process.exit(1);
+  console.error('FATAL ERROR: JWT_SECRET or REFRESH_TOKEN_SECRET is not defined in the .env file.');
+  process.exit(1);
 }
 
 const API_SECRET_KEY = process.env.API_SECRET_KEY;
@@ -26,69 +26,81 @@ const app = express();
 
 // --- Security Middleware ---
 app.use(cors());
-app.use(helmet()); // Secure HTTP headers
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:"],
+    },
+  },
+})); // Secure HTTP headers
 app.use(mongoSanitize()); // Sanitize MongoDB queries
 app.use(hpp()); // Prevent HTTP Parameter Pollution attacks
 app.use(xss()); // Sanitize user input
-app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = buf.toString(); } }));
-
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
 
 // Rate limiting for auth endpoints
 const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 create account/login requests per windowMs
-    message: "Too many requests from this IP, please try again after 15 minutes",
-    standardHeaders: true,
-    legacyHeaders: false,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // Limit each IP to 100 create account/login requests per windowMs
+  message: "Too many requests from this IP, please try again after 15 minutes",
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 app.use('/api/auth', authLimiter);
 
 // Apply the signature middleware globally to all routes
 const checkSignature = (req, res, next) => {
-    const publicRoutes = ['/api/auth/login', '/api/auth/register', '/api/auth/refresh', '/api/health'];
-    if (publicRoutes.includes(req.path)) {
-        return next();
-    }
+  const publicRoutes = ['/api/auth/login', '/api/auth/register', '/api/auth/refresh', '/api/health'];
+  if (publicRoutes.includes(req.path)) {
+    return next();
+  }
 
-    const timestamp = req.header('X-Request-Timestamp');
-    const signatureFromClient = req.header('X-Request-Signature');
+  const timestamp = req.header('X-Request-Timestamp');
+  const signatureFromClient = req.header('X-Request-Signature');
 
-    if (!timestamp || !signatureFromClient) {
-        return res.status(400).json({ message: 'Missing security headers.' });
-    }
+  if (!timestamp || !signatureFromClient) {
+    return res.status(400).json({ message: 'Missing security headers.' });
+  }
 
-    // --- Replay Attack Prevention ---
-    const now = Math.floor(Date.now() / 1000);
-    if (now - parseInt(timestamp) > 30) { // Reduced to 30-second tolerance
-        return res.status(408).json({ message: 'Request has expired. Please check your device time.' });
-    }
+  // --- Replay Attack Prevention ---
+  const now = Math.floor(Date.now() / 1000);
+  if (now - parseInt(timestamp) > 30) { // Reduced to 30-second tolerance
+    return res.status(408).json({ message: 'Request has expired. Please check your device time.' });
+  }
 
-    if (!API_SECRET_KEY) {
-        console.error('FATAL ERROR: API_SECRET_KEY is not defined in the .env file.');
-        return res.status(500).json({ message: 'Server configuration error' });
-    }
+  if (!API_SECRET_KEY) {
+    console.error('FATAL ERROR: API_SECRET_KEY is not defined in the .env file.');
+    return res.status(500).json({ message: 'Server configuration error' });
+  }
 
-    // --- Reconstruct the exact same string as the client ---
-    const method = req.method;
-    const path = req.originalUrl; // Use originalUrl to include query params
-    const body = req.rawBody && req.rawBody.length > 0 ? req.rawBody : null;
+  // --- Reconstruct the exact same string as the client ---
+  const method = req.method;
+  const path = req.originalUrl; // Use originalUrl to include query params
+  const body = req.rawBody && req.rawBody.length > 0 ? req.rawBody : null;
+  
+  let dataToSign = `${timestamp}.${method}.${path}`;
+  if (body) {
+    dataToSign += `.${body}`;
+  }
+
+  // --- Generate the signature on the server ---
+  const expectedSignature = crypto.createHmac('sha256', API_SECRET_KEY)
+    .update(dataToSign)
+    .digest('base64');
     
-    let dataToSign = `${timestamp}.${method}.${path}`;
-    if (body) {
-        dataToSign += `.${body}`;
-    }
-
-    // --- Generate the signature on the server ---
-    const expectedSignature = crypto.createHmac('sha256', API_SECRET_KEY)
-                                  .update(dataToSign)
-                                  .digest('base64');
-    
-    // --- Compare signatures ---
-    if (signatureFromClient !== expectedSignature) {
-        return res.status(403).json({ message: 'Invalid request signature.' });
-    }
-    
-    next();
+  // --- Compare signatures ---
+  if (signatureFromClient !== expectedSignature) {
+    return res.status(403).json({ message: 'Invalid request signature.' });
+  }
+  
+  next();
 };
 app.use('/api', checkSignature);
 
@@ -125,70 +137,127 @@ const checkAuth = (req, res, next) => {
   }
 };
 
-// ... (the rest of your code)
+// --- Muter configuration ---
+const storage = multer.memoryStorage(); // Store files in memory
+const upload = multer({
+    storage: storage,
+    limits: { fileSize: 1024 * 1024 * 5 }, // 5MB limit
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('image/')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only images are allowed'), false);
+        }
+    }
+});
+
+// --- Models ---
 const UserSchema = new mongoose.Schema({
-    refreshToken: { type: String, index: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    password: { type: String, required: true },
-    displayName: { type: String },
-    isAdmin: { type: Boolean, default: false }, 
-    isModemInstalled: { type: Boolean, default: false },
-    photoUrl: { type: String },
-    mobileNumber: { type: String },
-    birthday: { type: String },
-    gender: { type: String },
-    address: { type: String },
-    phase: { type: String },
-    city: { type: String },
-    province: { type: String },
-    zipCode: { type: String },
-    pushToken: { type: String },
-    accountCreatedAt: { type: Date, default: Date.now }, // Added creation timestamp
+  refreshToken: { type: String, index: true },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  password: { type: String, required: true },
+  displayName: { type: String },
+  isAdmin: { type: Boolean, default: false },
+  isModemInstalled: { type: Boolean, default: false },
+  photoUrl: { type: String },
+  mobileNumber: { type: String },
+  birthday: { type: String },
+  gender: { type: String },
+  address: { type: String },
+  phase: { type: String },
+  city: { type: String },
+  province: { type: String },
+  zipCode: { type: String },
+  pushToken: { type: String },
+  accountCreatedAt: { type: Date, default: Date.now },
 }, { timestamps: true });
 
+UserSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) {
+    return next();
+  }
+  const salt = await bcrypt.genSalt(10);
+  this.password = await bcrypt.hash(this.password, salt);
+  next();
+});
+UserSchema.methods.matchPassword = async function (enteredPassword) {
+  return await bcrypt.compare(enteredPassword, this.password);
+};
+
 const SubscriptionSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    status: { type: String, enum: ['active', 'pending_verification', 'pending_installation', 'declined', 'cancelled'], required: true },
-    plan: { name: String, price: Number, priceLabel: String, features: [String], },
-    paymentMethod: { type: String },
-    startDate: { type: Date },
-    renewalDate: { type: Date },
-    declineReason: { type: String },
-    history: [{ type: { type: String, required: true }, details: String, date: { type: Date, default: Date.now }, amount: Number, receiptNumber: String, planName: String, }],
-    proofOfPayment: { type: String, default: null } 
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  status: { type: String, enum: ['active', 'pending_verification', 'pending_installation', 'declined', 'cancelled'], required: true },
+  plan: { name: String, price: Number, priceLabel: String, features: [String] },
+  paymentMethod: { type: String },
+  startDate: { type: Date },
+  renewalDate: { type: Date },
+  declineReason: { type: String },
+  history: [{
+    type: { type: String, required: true },
+    details: String,
+    date: { type: Date, default: Date.now },
+    amount: Number,
+    receiptNumber: String,
+    planName: String
+  }],
+  proofOfPayment: { type: String, default: null }
 }, { timestamps: true });
-const BillSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, subscriptionId: { type: String, ref: 'Subscription', required: true }, planName: String, amount: Number, statementDate: { type: Date, default: Date.now }, dueDate: Date, status: { type: String, enum: ['Due', 'Paid', 'Overdue'], default: 'Due' }, paymentDate: Date, }, { timestamps: true });
-const FeedbackSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, userName: String, userPhotoUrl: String, rating: { type: Number, required: true }, text: { type: String, required: true }, }, { timestamps: true });
+
+const BillSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  subscriptionId: { type: String, ref: 'Subscription', required: true },
+  planName: String,
+  amount: Number,
+  statementDate: { type: Date, default: Date.now },
+  dueDate: Date,
+  status: { type: String, enum: ['Due', 'Paid', 'Overdue'], default: 'Due' },
+  paymentDate: Date,
+}, { timestamps: true });
+
+const FeedbackSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  userName: String,
+  userPhotoUrl: String,
+  rating: { type: Number, required: true },
+  text: { type: String, required: true },
+}, { timestamps: true });
+
 const SupportTicketSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    userName: String,
-    subject: { type: String, required: true },
-    description: { type: String, required: true },
-    status: { type: String, enum: ['Open', 'In Progress', 'Resolved', 'Closed'], default: 'Open' },
-    adminComment: { type: String, default: '' },
-    imageUrl: { type: String }, // For image uploads
-    // --- FIX: Added messages array to the schema to store conversation history ---
-    messages: [{
-        senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-        senderName: String,
-        text: { type: String, required: true },
-        isAdmin: { type: Boolean, default: false },
-        timestamp: { type: Date, default: Date.now }
-    }],
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  userName: String,
+  subject: { type: String, required: true },
+  description: { type: String, required: true },
+  status: { type: String, enum: ['Open', 'InProgress', 'Resolved', 'Closed'], default: 'Open' },
+  adminComment: { type: String, default: '' },
+  imageUrl: { type: String }, // For image uploads
+  messages: [{
+    senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    senderName: String,
+    text: { type: String, required: true },
+    isAdmin: { type: Boolean, default: false },
+    timestamp: { type: Date, default: Date.now }
+  }]
 }, { timestamps: true });
-const NotificationSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, title: { type: String, required: true }, message: { type: String, required: true }, type: { type: String, default: 'default' }, read: { type: Boolean, default: false }, }, { timestamps: true });
+
+const NotificationSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  type: { type: String, default: 'default' },
+  read: { type: Boolean, default: false },
+}, { timestamps: true });
+
 const LiveChatSessionSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    userName: String,
-    status: { type: String, enum: ['open', 'active', 'closed'], default: 'open' },
-    messages: [{
-        senderId: { type: String, required: true }, // Can be user ID or 'system'
-        senderName: String,
-        text: { type: String, required: true },
-        // --- FIX: Added isAdmin field to differentiate message styling on the frontend ---
-        isAdmin: { type: Boolean, default: false },
-        timestamp: { type: Date, default: Date.now }
-    }]
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  userName: String,
+  status: { type: String, enum: ['open', 'active', 'closed'], default: 'open' },
+  messages: [{
+    senderId: { type: String, required: true }, // Can be user ID or 'system'
+    senderName: String,
+    text: { type: String, required: true },
+    isAdmin: { type: Boolean, default: false },
+    timestamp: { type: Date, default: Date.now }
+  }]
 }, { timestamps: true });
 
 const LiveChatSession = mongoose.model('LiveChatSession', LiveChatSessionSchema);
