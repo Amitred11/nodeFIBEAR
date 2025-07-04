@@ -584,7 +584,7 @@ app.delete('/api/feedback/:id', checkAuth, asyncHandler(async (req, res) => {
 
     await feedback.deleteOne();
     res.json({ message: 'Feedback removed successfully.' });
-});
+}));
 
 // --- Support & Notification Routes ---
 app.post('/api/support/tickets', checkAuth, asyncHandler(async (req, res) => {
@@ -634,7 +634,7 @@ app.post('/api/support/tickets/:id/reply', checkAuth, asyncHandler(async (req, r
 
     const updatedTicket = await ticket.save();
     res.status(201).json(updatedTicket);
-});
+}));
 
 app.post('/api/support/request-agent', checkAuth, asyncHandler(async (req, res) => {
     const userId = req.user;
@@ -651,7 +651,7 @@ app.post('/api/support/request-agent', checkAuth, asyncHandler(async (req, res) 
 
     res.status(201).json({ message: 'Live chat session requested.', chatId: session._id });
 
-});
+}));
 
 app.post('/api/support/live-chat/:chatId/message', checkAuth, asyncHandler(async (req, res) => {
     const { text } = req.body;
@@ -667,14 +667,14 @@ app.post('/api/support/live-chat/:chatId/message', checkAuth, asyncHandler(async
     });
     await session.save();
     res.status(201).json(session);
-});
+}));
 
 app.get('/api/support/live-chat/:chatId', checkAuth, asyncHandler(async (req, res) => {
     const { chatId } = req.params;
     const session = await LiveChatSession.findById(chatId);
     if (!session || (session.userId.toString() !== req.user)) return res.status(404).json({ message: "Chat session not found or access denied." });
     res.status(200).json(session);
-});
+}));
 
 app.get('/api/support/live-chat/:chatId/listen', checkAuth, asyncHandler(async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -733,7 +733,7 @@ app.delete('/api/support/live-chat/:chatId/message/:messageId', checkAuth, async
     if (result.modifiedCount === 0) return res.status(404).json({ message: "Message not found or you are not authorized to delete it." });
 
     res.status(200).json({ message: 'Message deleted successfully.' });
-});
+}));
 
 app.get('/api/notifications', checkAuth, asyncHandler(async (req, res) => {
     const notifications = await Notification.find({ userId: req.user }).sort({ createdAt: -1 });
@@ -753,7 +753,7 @@ app.post('/api/notifications/delete', checkAuth, asyncHandler(async (req, res) =
     if (!ids || ids.length === 0) return res.status(400).json({ message: 'No notification IDs provided' });
     await Notification.deleteMany({ userId: req.user, _id: { $in: ids } });
     res.status(200).json({ message: 'Notifications deleted' });
-});
+}));
 
 // --- Admin Routes ---
 const adminRouter = express.Router();
@@ -786,7 +786,7 @@ adminRouter.post('/subscriptions/:id/decline', asyncHandler(async (req, res) => 
     }).save();
 
     res.json({ message: 'Subscription declined successfully.' });
-});
+}));
 
 adminRouter.get('/tickets', asyncHandler(async (req, res) => {
     const tickets = await SupportTicket.find().sort({ updatedAt: -1 });
@@ -834,20 +834,20 @@ adminRouter.post('/broadcast', asyncHandler(async (req, res) => {
     await Notification.insertMany(notifications);
 
     res.json({ message: `Broadcast sent to ${users.length} users.` });
-});
+}));
 
 adminRouter.get('/chats', asyncHandler(async (req, res) => {
     const sessions = await LiveChatSession.find({ status: { $in: ['open', 'active'] } })
         .populate('userId', 'displayName email')
         .sort({ updatedAt: -1 });
     res.json(sessions);
-});
+}));
 
 adminRouter.get('/chats/:chatId', asyncHandler(async (req, res) => {
     const session = await LiveChatSession.findById(req.params.chatId).populate('userId', 'displayName email');
     if (!session) return res.status(404).json({ message: "Chat session not found." });
     res.json(session);
-});
+}));
 
 adminRouter.post('/chats/:chatId/message', asyncHandler(async (req, res) => {
     const { chatId } = req.params;
@@ -877,7 +877,7 @@ adminRouter.post('/chats/:chatId/message', asyncHandler(async (req, res) => {
     }).save();
 
     res.status(201).json(updatedSession);
-});
+}));
 
 adminRouter.post('/chats/:chatId/close', asyncHandler(async (req, res) => {
     const updatedSession = await LiveChatSession.findByIdAndUpdate(
@@ -885,7 +885,7 @@ adminRouter.post('/chats/:chatId/close', asyncHandler(async (req, res) => {
     );
     if (!updatedSession) return res.status(404).json({ message: 'Chat session not found.' });
     res.json({ message: 'Chat session closed successfully.' });
-});
+}));
 
 // --- Deprecated Chatbot Route ---
 app.post('/api/chat', (req, res) => res.status(410).json({ message: "This endpoint is deprecated and no longer available. Please use the AI Chat service." }));
