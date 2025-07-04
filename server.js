@@ -538,7 +538,7 @@ app.post('/api/subscriptions/cancel', checkAuth, asyncHandler(async (req, res) =
     await subscription.save();
 
     res.status(200).json({ message: 'Subscription cancelled successfully.' });
-});
+}));
 
 app.post('/api/subscriptions/clear', checkAuth, asyncHandler(async (req, res) => {
     await Subscription.deleteOne({ userId: req.user, status: 'declined' });
