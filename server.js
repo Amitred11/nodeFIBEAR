@@ -529,10 +529,9 @@ app.post('/api/subscriptions/cancel', checkAuth, asyncHandler(async (req, res) =
 
     if (!subscription) return res.status(404).json({ message: 'No cancellable subscription found.' });
 
-    const originalStatus = subscription.status;
     subscription.history.unshift({
         type: 'cancelled',
-        details: `User cancelled the subscription while its status was '${originalStatus}'.`,
+        details: `User cancelled the subscription while its status was '${subscription.status}'.`,
         date: new Date(),
     });
     subscription.status = 'cancelled';
