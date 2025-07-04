@@ -1,12 +1,18 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');// FIX: This was a typo, should be require('jsonwebtoken')
+const jwt = require('jsonwebtoken');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const crypto = require('crypto');
+const helmet = require('helmet'); // Import Helmet
+const rateLimit = require('express-rate-limit'); // Import rateLimit
+const mongoSanitize = require('express-mongo-sanitize');
+const hpp = require('hpp');
+const xss = require('xss-clean');
+const multer = require('multer'); // For file upload security
+const path = require('path'); // For serving static content securely
 
 // --- Safety Check ---
 if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
@@ -18,23 +24,108 @@ const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
 const app = express();
 
+// --- Security Middleware ---
 app.use(cors());
-app.use(express.json({
-    limit: '10mb',
-    verify: (req, res, buf) => {
-        req.rawBody = buf.toString();
+app.use(helmet()); // Secure HTTP headers
+app.use(mongoSanitize()); // Sanitize MongoDB queries
+app.use(hpp()); // Prevent HTTP Parameter Pollution attacks
+app.use(xss()); // Sanitize user input
+app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = buf.toString(); } }));
+
+
+// Rate limiting for auth endpoints
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 create account/login requests per windowMs
+    message: "Too many requests from this IP, please try again after 15 minutes",
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api/auth', authLimiter);
+
+// Apply the signature middleware globally to all routes
+const checkSignature = (req, res, next) => {
+    const publicRoutes = ['/api/auth/login', '/api/auth/register', '/api/auth/refresh', '/api/health'];
+    if (publicRoutes.includes(req.path)) {
+        return next();
     }
-}));
 
-// --- DB Connection ---
-mongoose.connect(process.env.MONGO_URI)
-.then(() => console.log('MongoDB Connected Successfully.'))
-.catch((err) => console.error('MongoDB Connection Error:', err));
+    const timestamp = req.header('X-Request-Timestamp');
+    const signatureFromClient = req.header('X-Request-Signature');
 
-// =================================================================
-// --- SCHEMAS ---
-// =================================================================
+    if (!timestamp || !signatureFromClient) {
+        return res.status(400).json({ message: 'Missing security headers.' });
+    }
 
+    // --- Replay Attack Prevention ---
+    const now = Math.floor(Date.now() / 1000);
+    if (now - parseInt(timestamp) > 30) { // Reduced to 30-second tolerance
+        return res.status(408).json({ message: 'Request has expired. Please check your device time.' });
+    }
+
+    if (!API_SECRET_KEY) {
+        console.error('FATAL ERROR: API_SECRET_KEY is not defined in the .env file.');
+        return res.status(500).json({ message: 'Server configuration error' });
+    }
+
+    // --- Reconstruct the exact same string as the client ---
+    const method = req.method;
+    const path = req.originalUrl; // Use originalUrl to include query params
+    const body = req.rawBody && req.rawBody.length > 0 ? req.rawBody : null;
+    
+    let dataToSign = `${timestamp}.${method}.${path}`;
+    if (body) {
+        dataToSign += `.${body}`;
+    }
+
+    // --- Generate the signature on the server ---
+    const expectedSignature = crypto.createHmac('sha256', API_SECRET_KEY)
+                                  .update(dataToSign)
+                                  .digest('base64');
+    
+    // --- Compare signatures ---
+    if (signatureFromClient !== expectedSignature) {
+        return res.status(403).json({ message: 'Invalid request signature.' });
+    }
+    
+    next();
+};
+app.use('/api', checkSignature);
+
+// --- Authentication Middleware ---
+const checkAuth = (req, res, next) => {
+  let token;
+  const authHeader = req.headers.authorization;
+
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      token = authHeader.split(' ')[1];
+      const decoded = jwt.verify(token, process.env.JWT_SECRET); // No require
+
+      // Attach user to request - use a select() to minimize data loading
+      User.findById(decoded.id)
+        .select('-password -refreshToken') // Exclude sensitive fields
+        .then(user => {
+          if (!user) {
+            return res.status(401).json({ message: "Not authorized, user not found" });
+          }
+
+          req.user = user;  // Attach user object directly (no ID)
+          next();
+        })
+        .catch(error => {
+          console.error("Error fetching user", error);
+          return res.status(500).json({ message: "Server error while fetching user" });
+        });
+    } catch (error) {
+      return res.status(401).json({ message: 'Not authorized, token failed' });
+    }
+  } else {
+    return res.status(401).json({ message: 'Not authorized, no token' });
+  }
+};
+
+// ... (the rest of your code)
 const UserSchema = new mongoose.Schema({
     refreshToken: { type: String, index: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
@@ -52,10 +143,8 @@ const UserSchema = new mongoose.Schema({
     province: { type: String },
     zipCode: { type: String },
     pushToken: { type: String },
+    accountCreatedAt: { type: Date, default: Date.now }, // Added creation timestamp
 }, { timestamps: true });
-
-UserSchema.pre('save', async function(next) { if (!this.isModified('password')) return next(); const salt = await bcrypt.genSalt(10); this.password = await bcrypt.hash(this.password, salt); next(); });
-UserSchema.methods.matchPassword = async function(enteredPassword) { return await bcrypt.compare(enteredPassword, this.password); };
 
 const SubscriptionSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
@@ -110,77 +199,30 @@ const Feedback = mongoose.model('Feedback', FeedbackSchema);
 const SupportTicket = mongoose.model('SupportTicket', SupportTicketSchema);
 const Notification = mongoose.model('Notification', NotificationSchema);
 
-// --- AUTH MIDDLEWARE ---
-const checkAuth = (req, res, next) => { let token; const authHeader = req.headers.authorization; if (authHeader && authHeader.startsWith('Bearer ')) { try { token = authHeader.split(' ')[1]; const decoded = require('jsonwebtoken').verify(token, process.env.JWT_SECRET); req.user = decoded.id; next(); } catch (error) { res.status(401).json({ message: 'Not authorized, token failed' }); } } if (!token) { res.status(401).json({ message: 'Not authorized, no token' }); } };
+// --- Implementation ---
 const checkAdmin = async (req, res, next) => {
-    let token;
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-        try {
-            token = authHeader.split(' ')[1];
-            const decoded = require('jsonwebtoken').verify(token, process.env.JWT_SECRET);
-            const user = await User.findById(decoded.id).select('-password');
-            if (user && user.isAdmin) {
-                req.user = user; // Attach full admin user object to request
-                return next();
-            } else {
-                return res.status(403).json({ message: 'Access denied. Admin role required.' });
-            }
-        } catch (error) {
-            return res.status(401).json({ message: 'Not authorized, token failed' });
+    try {
+        // Check that JWT is valid by decoding. If not, it's an unauthorized attempt.
+        const decoded = jwt.verify(req.headers.authorization.split(' ')[1], process.env.JWT_SECRET);
+
+        // Load user without the password
+        const user = await User.findById(decoded.id).select('-password');
+
+        // Check if valid user and has admin rights
+        if (!user || !user.isAdmin) {
+            return res.status(403).json({ message: 'Access denied. Admin role required.' });
         }
-    }
-    if (!token) {
-        return res.status(401).json({ message: 'Not authorized, no token' });
+
+        // If authorized:
+        req.user = user;  // Attach user
+        next(); // Run the request
+    } catch (error) {
+        // If authorization check fails
+        console.error("Admin authorization error:", error); // For server side logging
+        return res.status(401).json({ message: 'Not authorized, token failed or missing.' }); // For client feedback
     }
 };
 
-const checkSignature = (req, res, next) => {
-    // Whitelist public routes that should not be signed
-    const publicRoutes = ['/api/auth/login', '/api/auth/register', '/api/auth/refresh', '/api/health'];
-    if (publicRoutes.includes(req.path)) {
-        return next();
-    }
-
-    const timestamp = req.header('X-Request-Timestamp');
-    const signatureFromClient = req.header('X-Request-Signature');
-
-    if (!timestamp || !signatureFromClient) {
-        return res.status(400).json({ message: 'Missing security headers.' });
-    }
-
-    // --- Replay Attack Prevention ---
-    const now = Math.floor(Date.now() / 1000);
-    if (now - parseInt(timestamp) > 60) { // 60-second tolerance
-        return res.status(408).json({ message: 'Request has expired. Please check your device time.' });
-    }
-
-    
-    // --- Reconstruct the exact same string as the client ---
-    const method = req.method;
-    const path = req.originalUrl; // Use originalUrl to include query params
-    const body = req.rawBody && req.rawBody.length > 0 ? req.rawBody : null;
-    
-    let dataToSign = `${timestamp}.${method}.${path}`;
-    if (body) {
-        dataToSign += `.${body}`;
-    }
-
-    // --- Generate the signature on the server ---
-    const expectedSignature = crypto.createHmac('sha256', API_SECRET_KEY)
-                                  .update(dataToSign)
-                                  .digest('base64');
-    
-    // --- Compare signatures ---
-    if (signatureFromClient !== expectedSignature) {
-        return res.status(403).json({ message: 'Invalid request signature.' });
-    }
-    
-    next();
-};
-
-// --- Apply the signature middleware globally to all routes ---
-app.use('/api', checkSignature);
 // =================================================================
 // --- API ROUTES ---
 // =================================================================
@@ -203,14 +245,14 @@ app.post('/api/auth/login', async (req, res) => {
             // --- NEW TOKEN LOGIC ---
 
             // 1. Create a short-lived Access Token (for accessing APIs)
-            const accessToken = require('jsonwebtoken').sign(
+            const accessToken = jwt.sign(
                 { id: user._id },
                 process.env.JWT_SECRET, // Or a dedicated ACCESS_TOKEN_SECRET
                 { expiresIn: '15m' }   // Expires in 15 minutes
             );
 
             // 2. Create a long-lived Refresh Token (for getting a new access token)
-            const refreshToken = require('jsonwebtoken').sign(
+            const refreshToken = jwt.sign(
                 { id: user._id },
                 process.env.REFRESH_TOKEN_SECRET, // Use a DIFFERENT secret for refresh tokens
                 { expiresIn: rememberMe ? '30d' : '1d' } // 30 days if "Remember Me", 1 day otherwise
@@ -251,15 +293,15 @@ app.post('/api/auth/refresh', async (req, res) => {
         if (!userInDb) return res.status(403).json({ message: "Invalid session. Please log in again." });
         
         // Verify the incoming refresh token
-        require('jsonwebtoken').verify(refreshToken, process.env.REFRESH_TOKEN_SECRET, async (err, user) => {
+        jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET, async (err, user) => {
             if (err) return res.status(403).json({ message: "Invalid or expired session. Please log in again." });
 
             // --- TOKEN ROTATION LOGIC ---
             // 1. Issue a new access token (short-lived)
-            const newAccessToken = require('jsonwebtoken').sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '15m' });
+            const newAccessToken = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '15m' });
             
             // 2. Issue a NEW refresh token (long-lived)
-            const newRefreshToken = require('jsonwebtoken').sign({ id: user.id }, process.env.REFRESH_TOKEN_SECRET, { expiresIn: '30d' });
+            const newRefreshToken = jwt.sign({ id: user.id }, process.env.REFRESH_TOKEN_SECRET, { expiresIn: '30d' });
 
             // 3. Save the NEW refresh token to the database, overwriting the old one.
             userInDb.refreshToken = newRefreshToken;
@@ -551,7 +593,7 @@ app.post('/api/support/request-agent', checkAuth, async (req, res) => {
             return res.status(200).json({ 
                 message: 'Existing chat session found.', 
                 chatId: session._id 
-            });
+});
         }
 
         // Step 3: If no session exists, create a new one.
