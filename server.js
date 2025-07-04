@@ -61,12 +61,6 @@ const registerSchema = Joi.object({
 });
 
 // --- Security Middleware Configuration ---
-app.use(cors({
-  origin: false, // disables CORS
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Timestamp', 'X-Request-Signature'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  credentials: true
-}));
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
