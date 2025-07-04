@@ -14,6 +14,7 @@ if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
     process.exit(1);
 }
 
+const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
 const app = express();
 
@@ -154,7 +155,6 @@ const checkSignature = (req, res, next) => {
         return res.status(408).json({ message: 'Request has expired. Please check your device time.' });
     }
 
-    const API_SECRET_KEY = '286f8bfd5bf6fc8018c243cb172ca78c72145e8c1c1617bba50846ea05c015e7ba2f6a2f166779557591e83baf09cebcbc7dcf7efdf152b5e017b743306a2ace';
     
     // --- Reconstruct the exact same string as the client ---
     const method = req.method;
