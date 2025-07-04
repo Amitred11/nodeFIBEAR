@@ -13,6 +13,9 @@ const hpp = require('hpp');
 const xss = require('xss-clean');
 const multer = require('multer');
 const Joi = require('joi');
+const { Readable } = require('stream');
+const { finished } = require('stream/promises');
+const fileType = require('file-type');
 
 // --- Safety Check ---
 if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
@@ -36,30 +39,48 @@ const validate = (schema) => (req, res, next) => {
 const errorHandler = (err, req, res, next) => {
     console.error(err.stack || err.message);
     const statusCode = res.statusCode || 500;
-    res.status(statusCode).json({
+    const response = {
         success: false,
-        message: err.message || 'Server Error',
-        stack: process.env.NODE_ENV === 'production' ? undefined : err.stack, // More concise
-    });
+        message: err.message || 'Server Error'
+    };
+
+    // Conditionally add stack trace based on environment
+    if (process.env.NODE_ENV !== 'production') {
+        response.stack = err.stack;
+    }
+
+    res.status(statusCode).json(response);
 };
 
 // --- Validation Schemas ---
 const registerSchema = Joi.object({
     email: Joi.string().email().required(),
-    password: Joi.string().min(6).required(),
+    password: Joi.string().min(12).regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+{}\[\]:;<>,.?~\\/-]).*$/)
+        .message("Password must be at least 12 characters and include one lowercase letter, one uppercase letter, one number, and one special character").required(),
     displayName: Joi.string().required(),
 });
 
 // --- Security Middleware Configuration ---
-app.use(cors());
+app.use(cors({
+    origin: process.env.ALLOWED_ORIGIN || '*',  // Replace * with specific origin in production
+    credentials: true
+}));
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            scriptSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrc: ["'self'"], // Removing 'unsafe-inline' - Enforce external scripts
             imgSrc: ["'self'", "data:"],
+            styleSrc: ["'self'"], // Ensure all styles are from 'self'
+            objectSrc: ["'none'"], // Disable object/embed elements
+            upgradeInsecureRequests: [],  // Upgrade insecure requests
         },
     },
+    frameguard: {
+        action: 'deny' // Prevent clickjacking
+    },
+    referrerPolicy: { policy: 'same-origin' }, // Only send referrer for same-origin requests
+    crossOriginEmbedderPolicy: false
 }));
 app.use(mongoSanitize());
 app.use(hpp());
@@ -163,16 +184,32 @@ const checkAdmin = asyncHandler(async (req, res, next) => {
 });
 
 // --- Multer Configuration ---
-const storage = multer.memoryStorage();
-const upload = multer({
-    storage: storage,
-    limits: { fileSize: 1024 * 1024 * 5 },
-    fileFilter: (req, file, cb) => {
-        if (file.mimetype.startsWith('image/')) {
-            cb(null, true);
-        } else {
-            cb(new Error('Only images are allowed'), false);
+const fileStorage = multer.memoryStorage();
+
+const fileUpload = multer({
+    storage: fileStorage,
+    limits: { fileSize: 1024 * 1024 * 5 },  // 5MB limit
+    fileFilter: async (req, file, cb) => {
+        const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif'];
+
+        if (!allowedMimeTypes.includes(file.mimetype)) {
+            return cb(new Error('Invalid file type. Only JPEG, PNG, and GIF are allowed.'), false);
         }
+
+        // Additional security: Check file content using `file-type` package
+        const buffer = file.stream.read(); // Read a chunk of the file
+
+        if (!buffer) {
+            return cb(new Error('Could not read file buffer.'), false);
+        }
+
+        const type = await fileType.fromBuffer(buffer);
+
+        if (!type || !allowedMimeTypes.includes(type.mime)) {
+            return cb(new Error('File content does not match the declared MIME type.'), false);
+        }
+
+        cb(null, true);
     }
 });
 
@@ -199,7 +236,7 @@ const UserSchema = new mongoose.Schema({
 
 UserSchema.pre('save', async function (next) {
     if (!this.isModified('password')) return next();
-    const salt = await bcrypt.genSalt(10);
+    const salt = await bcrypt.genSalt(12);
     this.password = await bcrypt.hash(this.password, salt);
     next();
 });
@@ -292,6 +329,12 @@ const Feedback = mongoose.model('Feedback', FeedbackSchema);
 const SupportTicket = mongoose.model('SupportTicket', SupportTicketSchema);
 const Notification = mongoose.model('Notification', NotificationSchema);
 
+// --- Security Best Practices ---
+console.warn("SECURITY: Implement automated security scanning in CI/CD.");
+console.warn("SECURITY: Schedule regular security audits by experts.");
+console.warn("SECURITY: Establish a vulnerability disclosure program.");
+console.warn("SECURITY: Define and practice an incident response plan.");
+
 // --- API ROUTES ---
 // --- Auth Routes (Public) ---
 app.get('/api/health', (req, res) => res.status(200).json({ status: "ok", message: "Node.js server is running." }));
@@ -302,6 +345,7 @@ app.post('/api/auth/register', validate(registerSchema), asyncHandler(async (req
     if (userExists) return res.status(400).json({ message: 'User with this email already exists.' });
     const user = new User({ displayName, email, password });
     await user.save();
+    // Consider sending a welcome email here
     res.status(201).json({ message: 'User registered successfully.' });
 }));
 
@@ -499,7 +543,7 @@ app.post('/api/subscriptions/cancel', checkAuth, asyncHandler(async (req, res) =
     await subscription.save();
 
     res.status(200).json({ message: 'Subscription cancelled successfully.' });
-}));
+});
 
 app.post('/api/subscriptions/clear', checkAuth, asyncHandler(async (req, res) => {
     await Subscription.deleteOne({ userId: req.user, status: 'declined' });
@@ -545,7 +589,7 @@ app.delete('/api/feedback/:id', checkAuth, asyncHandler(async (req, res) => {
 
     await feedback.deleteOne();
     res.json({ message: 'Feedback removed successfully.' });
-}));
+});
 
 // --- Support & Notification Routes ---
 app.post('/api/support/tickets', checkAuth, asyncHandler(async (req, res) => {
@@ -568,7 +612,6 @@ app.post('/api/support/tickets', checkAuth, asyncHandler(async (req, res) => {
     }).save();
 
     res.status(201).json(newTicket);
-
 }));
 
 app.get('/api/support/tickets', checkAuth, asyncHandler(async (req, res) => {
@@ -596,7 +639,7 @@ app.post('/api/support/tickets/:id/reply', checkAuth, asyncHandler(async (req, r
 
     const updatedTicket = await ticket.save();
     res.status(201).json(updatedTicket);
-}));
+});
 
 app.post('/api/support/request-agent', checkAuth, asyncHandler(async (req, res) => {
     const userId = req.user;
@@ -613,7 +656,7 @@ app.post('/api/support/request-agent', checkAuth, asyncHandler(async (req, res) 
 
     res.status(201).json({ message: 'Live chat session requested.', chatId: session._id });
 
-}));
+});
 
 app.post('/api/support/live-chat/:chatId/message', checkAuth, asyncHandler(async (req, res) => {
     const { text } = req.body;
@@ -629,14 +672,14 @@ app.post('/api/support/live-chat/:chatId/message', checkAuth, asyncHandler(async
     });
     await session.save();
     res.status(201).json(session);
-}));
+});
 
 app.get('/api/support/live-chat/:chatId', checkAuth, asyncHandler(async (req, res) => {
     const { chatId } = req.params;
     const session = await LiveChatSession.findById(chatId);
     if (!session || (session.userId.toString() !== req.user)) return res.status(404).json({ message: "Chat session not found or access denied." });
     res.status(200).json(session);
-}));
+});
 
 app.get('/api/support/live-chat/:chatId/listen', checkAuth, asyncHandler(async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -669,7 +712,7 @@ app.get('/api/support/live-chat/:chatId/listen', checkAuth, asyncHandler(async (
         changeStream.close();
         res.end();
     });
-}));
+});
 
 app.delete('/api/support/live-chat/:chatId', checkAuth, asyncHandler(async (req, res) => {
     const { chatId } = req.params;
@@ -678,7 +721,7 @@ app.delete('/api/support/live-chat/:chatId', checkAuth, asyncHandler(async (req,
 
     await session.deleteOne();
     res.status(200).json({ message: 'Chat session deleted successfully.' });
-}));
+});
 
 app.delete('/api/support/live-chat/:chatId/message/:messageId', checkAuth, asyncHandler(async (req, res) => {
     const { chatId, messageId } = req.params;
@@ -695,7 +738,7 @@ app.delete('/api/support/live-chat/:chatId/message/:messageId', checkAuth, async
     if (result.modifiedCount === 0) return res.status(404).json({ message: "Message not found or you are not authorized to delete it." });
 
     res.status(200).json({ message: 'Message deleted successfully.' });
-}));
+});
 
 app.get('/api/notifications', checkAuth, asyncHandler(async (req, res) => {
     const notifications = await Notification.find({ userId: req.user }).sort({ createdAt: -1 });
@@ -715,7 +758,7 @@ app.post('/api/notifications/delete', checkAuth, asyncHandler(async (req, res) =
     if (!ids || ids.length === 0) return res.status(400).json({ message: 'No notification IDs provided' });
     await Notification.deleteMany({ userId: req.user, _id: { $in: ids } });
     res.status(200).json({ message: 'Notifications deleted' });
-}));
+});
 
 // --- Admin Routes ---
 const adminRouter = express.Router();
@@ -748,7 +791,7 @@ adminRouter.post('/subscriptions/:id/decline', asyncHandler(async (req, res) => 
     }).save();
 
     res.json({ message: 'Subscription declined successfully.' });
-}));
+});
 
 adminRouter.get('/tickets', asyncHandler(async (req, res) => {
     const tickets = await SupportTicket.find().sort({ updatedAt: -1 });
@@ -776,7 +819,7 @@ adminRouter.post('/tickets/:id/status', asyncHandler(async (req, res) => {
     }).save();
 
     res.json({ message: 'Ticket status updated successfully.' });
-}));
+});
 
 adminRouter.post('/broadcast', asyncHandler(async (req, res) => {
     const { title, message } = req.body;
@@ -796,20 +839,20 @@ adminRouter.post('/broadcast', asyncHandler(async (req, res) => {
     await Notification.insertMany(notifications);
 
     res.json({ message: `Broadcast sent to ${users.length} users.` });
-}));
+});
 
 adminRouter.get('/chats', asyncHandler(async (req, res) => {
     const sessions = await LiveChatSession.find({ status: { $in: ['open', 'active'] } })
         .populate('userId', 'displayName email')
         .sort({ updatedAt: -1 });
     res.json(sessions);
-}));
+});
 
 adminRouter.get('/chats/:chatId', asyncHandler(async (req, res) => {
     const session = await LiveChatSession.findById(req.params.chatId).populate('userId', 'displayName email');
     if (!session) return res.status(404).json({ message: "Chat session not found." });
     res.json(session);
-}));
+});
 
 adminRouter.post('/chats/:chatId/message', asyncHandler(async (req, res) => {
     const { chatId } = req.params;
@@ -839,7 +882,7 @@ adminRouter.post('/chats/:chatId/message', asyncHandler(async (req, res) => {
     }).save();
 
     res.status(201).json(updatedSession);
-}));
+});
 
 adminRouter.post('/chats/:chatId/close', asyncHandler(async (req, res) => {
     const updatedSession = await LiveChatSession.findByIdAndUpdate(
@@ -847,7 +890,7 @@ adminRouter.post('/chats/:chatId/close', asyncHandler(async (req, res) => {
     );
     if (!updatedSession) return res.status(404).json({ message: 'Chat session not found.' });
     res.json({ message: 'Chat session closed successfully.' });
-}));
+});
 
 // --- Deprecated Chatbot Route ---
 app.post('/api/chat', (req, res) => res.status(410).json({ message: "This endpoint is deprecated and no longer available. Please use the AI Chat service." }));
@@ -858,9 +901,46 @@ app.use((req, res, next) => {
     res.redirect(`https://${req.headers.host}${req.url}`);
 });
 
+// --- Logging Middleware ---
+app.use((req, res, next) => {
+    const start = Date.now();
+
+    res.on('finish', () => {
+        const duration = Date.now() - start;
+        console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms`);
+    });
+
+    next();
+});
+
 // --- Error Handler ---
 app.use(errorHandler);
 
+// --- Unhandled Rejection Handler ---
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    // Optionally, shut down the application
+    // process.exit(1);
+});
+
+// --- Uncaught Exception Handler ---
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err);
+    // Optionally, shut down the application
+    // process.exit(1);
+});
+
+// --- Security Best Practices ---
+console.warn("SECURITY: Implement automated security scanning in CI/CD.");
+console.warn("SECURITY: Schedule regular security audits by experts.");
+console.warn("SECURITY: Establish a vulnerability disclosure program.");
+console.warn("SECURITY: Define and practice an incident response plan.");
+
 // --- Server Start ---
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+mongoose.connect(process.env.MONGODB_URI)
+    .then(() => {
+        console.log('Connected to MongoDB');
+        app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    })
+    .catch(err => console.error('MongoDB connection error:', err));
