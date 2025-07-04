@@ -4,8 +4,9 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const jwt = 'jsonwebtoken'; // FIX: This was a typo, should be require('jsonwebtoken')
+const jwt = require('jsonwebtoken');// FIX: This was a typo, should be require('jsonwebtoken')
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const crypto = require('crypto');
 
 // --- Safety Check ---
 if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
@@ -17,7 +18,12 @@ if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET) {
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({
+    limit: '10mb',
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString();
+    }
+}));
 
 // --- DB Connection ---
 mongoose.connect(process.env.MONGO_URI)
@@ -127,6 +133,54 @@ const checkAdmin = async (req, res, next) => {
         return res.status(401).json({ message: 'Not authorized, no token' });
     }
 };
+
+const checkSignature = (req, res, next) => {
+    // Whitelist public routes that should not be signed
+    const publicRoutes = ['/api/auth/login', '/api/auth/register', '/api/auth/refresh', '/api/health'];
+    if (publicRoutes.includes(req.path)) {
+        return next();
+    }
+
+    const timestamp = req.header('X-Request-Timestamp');
+    const signatureFromClient = req.header('X-Request-Signature');
+
+    if (!timestamp || !signatureFromClient) {
+        return res.status(400).json({ message: 'Missing security headers.' });
+    }
+
+    // --- Replay Attack Prevention ---
+    const now = Math.floor(Date.now() / 1000);
+    if (now - parseInt(timestamp) > 60) { // 60-second tolerance
+        return res.status(408).json({ message: 'Request has expired. Please check your device time.' });
+    }
+
+    const API_SECRET_KEY = '286f8bfd5bf6fc8018c243cb172ca78c72145e8c1c1617bba50846ea05c015e7ba2f6a2f166779557591e83baf09cebcbc7dcf7efdf152b5e017b743306a2ace';
+    
+    // --- Reconstruct the exact same string as the client ---
+    const method = req.method;
+    const path = req.originalUrl; // Use originalUrl to include query params
+    const body = req.rawBody && req.rawBody.length > 0 ? req.rawBody : null;
+    
+    let dataToSign = `${timestamp}.${method}.${path}`;
+    if (body) {
+        dataToSign += `.${body}`;
+    }
+
+    // --- Generate the signature on the server ---
+    const expectedSignature = crypto.createHmac('sha256', API_SECRET_KEY)
+                                  .update(dataToSign)
+                                  .digest('base64');
+    
+    // --- Compare signatures ---
+    if (signatureFromClient !== expectedSignature) {
+        return res.status(403).json({ message: 'Invalid request signature.' });
+    }
+    
+    next();
+};
+
+// --- Apply the signature middleware globally to all routes ---
+app.use('/api', checkSignature);
 // =================================================================
 // --- API ROUTES ---
 // =================================================================
