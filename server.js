@@ -26,12 +26,11 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // --- Safety Check ---
-if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI || !process.env.API_SECRET_KEY) {
+if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI) {
     logger.error('FATAL ERROR: A required environment variable is not defined.');
     process.exit(1);
 }
 
-const API_SECRET_KEY = process.env.API_SECRET_KEY;
 const app = express();
 
 // --- Core Middleware ---
