@@ -176,17 +176,28 @@ app.put('/api/users/me', authorize(), asyncHandler(async (req, res) => {
     res.json(updatedUser);
 }));
 
-app.post('/api/users/me/photo', authorize(), fileUpload.single('profilePic'), asyncHandler(async (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ message: 'No file uploaded.' });
+app.post('/api/users/me/photo', authorize(), asyncHandler(async (req, res) => {
+    const { base64, mimeType } = req.body;
+
+    if (!base64 || !mimeType) {
+        return res.status(400).json({ message: 'Base64 image data and mimeType are required.' });
     }
+    
+    // Basic validation for allowed types
     const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif'];
-    const filetype = await fileTypeFromBuffer(req.file.buffer);
-    if (!filetype || !allowedMimeTypes.includes(filetype.mime)) {
+    if (!allowedMimeTypes.includes(mimeType)) {
         return res.status(400).json({ message: 'Invalid file type. Only JPEG, PNG, and GIF are allowed.' });
     }
-    const photoUrl = `data:${filetype.mime};base64,${req.file.buffer.toString('base64')}`;
+
+    // Construct the data URI to be stored in the database
+    const photoUrl = `data:${mimeType};base64,${base64}`;
+
     const user = await User.findByIdAndUpdate(req.user.id, { photoUrl }, { new: true }).select('-password');
+
+    if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+    }
+
     res.status(200).json({ message: 'Photo uploaded successfully.', user });
 }));
 
