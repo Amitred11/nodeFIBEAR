@@ -40,12 +40,10 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // --- Safety Check ---
-if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI || !process.env.API_SECRET_KEY) {
-    logger.error('FATAL ERROR: A required environment variable (JWT_SECRET, REFRESH_TOKEN_SECRET, MONGODB_URI, or API_SECRET_KEY) is not defined.');
+if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI || !process.env.API_KEY) { // <-- Added API_KEY check
+    logger.error('FATAL ERROR: A required environment variable is not defined.');
     process.exit(1);
 }
-
-const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
 const app = express();
 
@@ -90,27 +88,20 @@ const validate = (schema) => (req, res, next) => {
 
 // --- Security Middleware ---
 
-// Signature Verification
-const checkSignature = (req, res, next) => {
+const checkApiKey = (req, res, next) => {
     const publicRoutes = ['/api/auth/login', '/api/auth/register', '/api/auth/refresh', '/api/health'];
-    if (publicRoutes.some(route => req.path.startsWith(route))) return next();
+    if (publicRoutes.some(route => req.path.startsWith(route))) {
+        return next();
+    }
+    
+    const apiKey = req.header('X-API-Key');
+    if (!apiKey) {
+        return res.status(401).json({ message: 'Missing API Key.' });
+    }
 
-    const timestamp = req.header('X-Request-Timestamp');
-    const signatureFromClient = req.header('X-Request-Signature');
-    if (!timestamp || !signatureFromClient) return res.status(400).json({ message: 'Missing security headers.' });
-
-    const now = Math.floor(Date.now() / 1000);
-    if (now - parseInt(timestamp, 10) > 60) return res.status(408).json({ message: 'Request has expired. Please check your device time.' });
-
-    const method = req.method;
-    const path = req.originalUrl;
-    const body = req.rawBody && req.method !== 'GET' ? req.rawBody : '';
-    const dataToSign = `${timestamp}.${method}.${path}.${body}`;
-    const expectedSignature = crypto.createHmac('sha256', API_SECRET_KEY).update(dataToSign).digest('base64');
-
-    if (signatureFromClient !== expectedSignature) {
-        logger.warn(`Invalid signature attempt for path: ${path}`);
-        return res.status(403).json({ message: 'Invalid request signature.' });
+    if (apiKey !== process.env.API_KEY) {
+        logger.warn(`Invalid API Key received: ${apiKey}`);
+        return res.status(403).json({ message: 'Invalid API Key.' });
     }
 
     next();
@@ -142,7 +133,7 @@ const authorize = (role = null) => asyncHandler(async (req, res, next) => {
         return res.status(401).json({ message: 'Token is not valid or has expired.' });
     }
 });
-app.use('/api', checkSignature);
+app.use('/api', checkApiKey);
 
 // --- Multer Configuration ---
 const fileStorage = multer.memoryStorage();
