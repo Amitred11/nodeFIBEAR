@@ -91,6 +91,20 @@ const authorize = (role = null) => asyncHandler(async (req, res, next) => {
     }
 });
 
+const fileStorage = multer.memoryStorage();
+const fileUpload = multer({
+    storage: fileStorage,
+    limits: { fileSize: 1024 * 1024 * 5 }, // 5MB limit
+    fileFilter: (req, file, cb) => {
+        // Basic check for image mime types
+        if (file.mimetype.startsWith('image/')) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only images are allowed.'), false);
+        }
+    }
+});
+
 // --- Validation Schemas ---
 const registerSchema = Joi.object({
     email: Joi.string().email().required(),
