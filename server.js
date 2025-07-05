@@ -1,12 +1,10 @@
-// --- Dependencies ---
+/// server.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const crypto = require('crypto');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const mongoSanitize = require('express-mongo-sanitize');
@@ -14,33 +12,20 @@ const hpp = require('hpp');
 const xss = require('xss-clean');
 const multer = require('multer');
 const Joi = require('joi');
-const { fileTypeFromBuffer } = require('file-type');
 const winston = require('winston');
 
-// --- Logger Configuration (Winston) ---
+// --- Logger Configuration ---
 const logger = winston.createLogger({
     level: 'info',
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.json()
-    ),
-    transports: [
-        new winston.transports.File({ filename: 'error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'combined.log' }),
-    ],
+    format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
+    transports: [ new winston.transports.File({ filename: 'error.log', level: 'error' }), new winston.transports.File({ filename: 'combined.log' }) ],
 });
-
 if (process.env.NODE_ENV !== 'production') {
-    logger.add(new winston.transports.Console({
-        format: winston.format.combine(
-            winston.format.colorize(),
-            winston.format.simple()
-        ),
-    }));
+    logger.add(new winston.transports.Console({ format: winston.format.combine(winston.format.colorize(), winston.format.simple()) }));
 }
 
 // --- Safety Check ---
-if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI || !process.env.API_KEY) { // <-- Added API_KEY check
+if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI) {
     logger.error('FATAL ERROR: A required environment variable is not defined.');
     process.exit(1);
 }
@@ -50,129 +35,73 @@ const app = express();
 // --- Core Middleware ---
 app.use(helmet());
 app.use(cors());
-app.use(express.json({
-    limit: '10mb',
-    verify: (req, res, buf) => {
-        req.rawBody = buf.toString();
-    }
-}));
+app.use(express.json({ limit: '10mb' }));
 app.use(mongoSanitize());
 app.use(hpp());
 app.use(xss());
 
-// --- Content-Type Restriction Middleware ---
-app.use((req, res, next) => {
-    if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
-        if (!req.is('application/json') && !req.is('multipart/form-data')) {
-            return res.status(415).json({ message: 'Unsupported Content-Type. This endpoint only accepts application/json or multipart/form-data.' });
-        }
-    }
-    next();
-});
-
 // --- Rate Limiting ---
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: "Too many authentication attempts. Please try again after 15 minutes.", standardHeaders: true, legacyHeaders: false });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: "Too many authentication attempts.", standardHeaders: true, legacyHeaders: false });
 app.use('/api/auth', authLimiter);
-
-const generalLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 200, message: 'Too many requests. Please try again later.', standardHeaders: true, legacyHeaders: false });
+const generalLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 200, message: 'Too many requests.', standardHeaders: true, legacyHeaders: false });
 app.use(['/api/support', '/api/subscriptions', '/api/users', '/api/admin', '/api/feedback', '/api/notifications'], generalLimiter);
 
-// --- Utility Middleware ---
+// --- Mongoose Schemas & Models ---
+const UserSchema = new mongoose.Schema({ refreshToken: { type: String, index: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, password: { type: String, required: true }, displayName: { type: String }, isAdmin: { type: Boolean, default: false }, isModemInstalled: { type: Boolean, default: false }, photoUrl: { type: String }, mobileNumber: { type: String }, birthday: { type: String }, gender: { type: String }, address: { type: String }, phase: { type: String }, city: { type: String }, province: { type: String }, zipCode: { type: String }, pushToken: { type: String } }, { timestamps: true });
+UserSchema.pre('save', async function (next) { if (!this.isModified('password')) return next(); const salt = await bcrypt.genSalt(12); this.password = await bcrypt.hash(this.password, salt); next(); });
+UserSchema.methods.matchPassword = async function (enteredPassword) { return await bcrypt.compare(enteredPassword, this.password); };
+const User = mongoose.model('User', UserSchema);
+
+const SubscriptionSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, status: { type: String, enum: ['active', 'pending_verification', 'pending_installation', 'declined', 'cancelled'], required: true }, plan: { name: String, price: Number, priceLabel: String, features: [String] }, paymentMethod: { type: String }, startDate: { type: Date }, renewalDate: { type: Date }, declineReason: { type: String }, history: [{ type: { type: String, required: true }, details: String, date: { type: Date, default: Date.now }, amount: Number, receiptNumber: String, planName: String }], proofOfPayment: { type: String, default: null } }, { timestamps: true });
+const Subscription = mongoose.model('Subscription', SubscriptionSchema);
+
+const BillSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, subscriptionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Subscription', required: true }, planName: String, amount: Number, statementDate: { type: Date, default: Date.now }, dueDate: Date, status: { type: String, enum: ['Due', 'Paid', 'Overdue'], default: 'Due' }, paymentDate: Date, }, { timestamps: true });
+const Bill = mongoose.model('Bill', BillSchema);
+
+const FeedbackSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, userName: String, userPhotoUrl: String, rating: { type: Number, required: true }, text: { type: String, required: true }, }, { timestamps: true });
+const Feedback = mongoose.model('Feedback', FeedbackSchema);
+
+const SupportTicketSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, userName: String, subject: { type: String, required: true }, description: { type: String, required: true }, status: { type: String, enum: ['Open', 'In Progress', 'Resolved', 'Closed'], default: 'Open' }, adminComment: { type: String, default: '' }, imageUrl: { type: String } }, { timestamps: true });
+const SupportTicket = mongoose.model('SupportTicket', SupportTicketSchema);
+
+const NotificationSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, title: { type: String, required: true }, message: { type: String, required: true }, type: { type: String, default: 'default' }, read: { type: Boolean, default: false }, }, { timestamps: true });
+const Notification = mongoose.model('Notification', NotificationSchema);
+
+const LiveChatSessionSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, userName: String, status: { type: String, enum: ['open', 'active', 'closed'], default: 'open' }, messages: [{ senderId: { type: String, required: true }, senderName: String, text: { type: String, required: true }, isAdmin: { type: Boolean, default: false }, timestamp: { type: Date, default: Date.now } }] }, { timestamps: true });
+const LiveChatSession = mongoose.model('LiveChatSession', LiveChatSessionSchema);
+
+// --- Utility & Security Middleware ---
 const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const validate = (schema) => (req, res, next) => { const { error } = schema.validate(req.body); if (error) return res.status(400).json({ message: error.details[0].message }); next(); };
 
-const validate = (schema) => (req, res, next) => {
-    const { error } = schema.validate(req.body);
-    if (error) return res.status(400).json({ message: error.details[0].message });
-    next();
-};
-
-// --- Security Middleware ---
-
-const checkApiKey = (req, res, next) => {
-    const publicRoutes = ['/api/auth/login', '/api/auth/register', '/api/auth/refresh', '/api/health'];
-    if (publicRoutes.some(route => req.path.startsWith(route))) {
-        return next();
-    }
-    
-    const apiKey = req.header('X-API-Key');
-    if (!apiKey) {
-        return res.status(401).json({ message: 'Missing API Key.' });
-    }
-
-    if (apiKey !== process.env.API_KEY) {
-        logger.warn(`Invalid API Key received: ${apiKey}`);
-        return res.status(403).json({ message: 'Invalid API Key.' });
-    }
-
-    next();
-};
-
-// Unified Authentication & Authorization Middleware
 const authorize = (role = null) => asyncHandler(async (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ message: 'Authorization token is required.' });
-    }
-
+    if (!authHeader || !authHeader.startsWith('Bearer ')) { return res.status(401).json({ message: 'Authorization token is required.' }); }
     const token = authHeader.split(' ')[1];
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         const user = await User.findById(decoded.id).select('-password');
-        if (!user) {
-            return res.status(401).json({ message: "User not found, authorization denied." });
-        }
+        if (!user) { return res.status(401).json({ message: "User not found, authorization denied." }); }
         req.user = user;
-
-        if (role === 'admin' && !user.isAdmin) {
-            return res.status(403).json({ message: 'Access denied. Admin role required.' });
-        }
-
+        if (role === 'admin' && !user.isAdmin) { return res.status(403).json({ message: 'Access denied. Admin role required.' }); }
         next();
     } catch (error) {
         logger.warn(`Token verification failed: ${error.message}`);
         return res.status(401).json({ message: 'Token is not valid or has expired.' });
     }
 });
-app.use('/api', checkApiKey);
-
-// --- Multer Configuration ---
-const fileStorage = multer.memoryStorage();
-const fileUpload = multer({
-    storage: fileStorage,
-    limits: { fileSize: 1024 * 1024 * 5 }, // 5MB limit
-});
-
-// --- Models ---
-const UserSchema = new mongoose.Schema({ refreshToken: { type: String, index: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, password: { type: String, required: true }, displayName: { type: String }, isAdmin: { type: Boolean, default: false }, isModemInstalled: { type: Boolean, default: false }, photoUrl: { type: String }, mobileNumber: { type: String }, birthday: { type: String }, gender: { type: String }, address: { type: String }, phase: { type: String }, city: { type: String }, province: { type: String }, zipCode: { type: String }, pushToken: { type: String }, accountCreatedAt: { type: Date, default: Date.now }, }, { timestamps: true });
-UserSchema.pre('save', async function (next) { if (!this.isModified('password')) return next(); const salt = await bcrypt.genSalt(12); this.password = await bcrypt.hash(this.password, salt); next(); });
-UserSchema.methods.matchPassword = async function (enteredPassword) { return await bcrypt.compare(enteredPassword, this.password); };
-const SubscriptionSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, status: { type: String, enum: ['active', 'pending_verification', 'pending_installation', 'declined', 'cancelled'], required: true }, plan: { name: String, price: Number, priceLabel: String, features: [String] }, paymentMethod: { type: String }, startDate: { type: Date }, renewalDate: { type: Date }, declineReason: { type: String }, history: [{ type: { type: String, required: true }, details: String, date: { type: Date, default: Date.now }, amount: Number, receiptNumber: String, planName: String }], proofOfPayment: { type: String, default: null } }, { timestamps: true });
-const BillSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, subscriptionId: { type: String, ref: 'Subscription', required: true }, planName: String, amount: Number, statementDate: { type: Date, default: Date.now }, dueDate: Date, status: { type: String, enum: ['Due', 'Paid', 'Overdue'], default: 'Due' }, paymentDate: Date, }, { timestamps: true });
-const FeedbackSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, userName: String, userPhotoUrl: String, rating: { type: Number, required: true }, text: { type: String, required: true }, }, { timestamps: true });
-const SupportTicketSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, userName: String, subject: { type: String, required: true }, description: { type: String, required: true }, status: { type: String, enum: ['Open', 'InProgress', 'Resolved', 'Closed'], default: 'Open' }, adminComment: { type: String, default: '' }, imageUrl: { type: String }, messages: [{ senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, senderName: String, text: { type: String, required: true }, isAdmin: { type: Boolean, default: false }, timestamp: { type: Date, default: Date.now } }] }, { timestamps: true });
-const NotificationSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, title: { type: String, required: true }, message: { type: String, required: true }, type: { type: String, default: 'default' }, read: { type: Boolean, default: false }, }, { timestamps: true });
-const LiveChatSessionSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, userName: String, status: { type: String, enum: ['open', 'active', 'closed'], default: 'open' }, messages: [{ senderId: { type: String, required: true }, senderName: String, text: { type: String, required: true }, isAdmin: { type: Boolean, default: false }, timestamp: { type: Date, default: Date.now } }] }, { timestamps: true });
-
-const LiveChatSession = mongoose.model('LiveChatSession', LiveChatSessionSchema);
-const User = mongoose.model('User', UserSchema);
-const Subscription = mongoose.model('Subscription', SubscriptionSchema);
-const Bill = mongoose.model('Bill', BillSchema);
-const Feedback = mongoose.model('Feedback', FeedbackSchema);
-const SupportTicket = mongoose.model('SupportTicket', SupportTicketSchema);
-const Notification = mongoose.model('Notification', NotificationSchema);
 
 // --- Validation Schemas ---
 const registerSchema = Joi.object({
     email: Joi.string().email().required(),
-    password: Joi.string().min(12).regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+{}\[\]:;<>,.?~\\/-]).*$/)
-        .message("Password must be at least 12 characters and include one lowercase letter, one uppercase letter, one number, and one special character").required(),
+    password: Joi.string().min(8).regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+{}\[\]:;<>,.?~\\/-]).*$/).message("Password must be at least 8 characters and include an uppercase letter, a number, and a special character").required(),
     displayName: Joi.string().required(),
 });
 const passwordChangeSchema = Joi.object({
     currentPassword: Joi.string().required(),
-    newPassword: Joi.string().min(12).regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+{}\[\]:;<>,.?~\\/-]).*$/)
-        .message("New password must meet complexity requirements.").required()
+    newPassword: Joi.string().min(8).regex(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+{}\[\]:;<>,.?~\\/-]).*$/).message("New password must meet complexity requirements.").required()
 });
+
 
 // --- API ROUTES ---
 // --- Auth Routes ---
