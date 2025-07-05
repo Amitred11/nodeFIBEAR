@@ -32,6 +32,7 @@ if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env
 }
 
 const app = express();
+app.set('trust proxy', 1); 
 
 // --- Core Middleware ---
 app.use(helmet());
