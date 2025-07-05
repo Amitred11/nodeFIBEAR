@@ -1,4 +1,4 @@
-/// server.js
+// server.js
 require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
@@ -12,6 +12,7 @@ const hpp = require('hpp');
 const xss = require('xss-clean');
 const multer = require('multer');
 const Joi = require('joi');
+const crypto = require('crypto');
 const winston = require('winston');
 
 // --- Logger Configuration ---
@@ -25,17 +26,18 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // --- Safety Check ---
-if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI) {
+if (!process.env.JWT_SECRET || !process.env.REFRESH_TOKEN_SECRET || !process.env.MONGODB_URI || !process.env.API_SECRET_KEY) {
     logger.error('FATAL ERROR: A required environment variable is not defined.');
     process.exit(1);
 }
 
+const API_SECRET_KEY = process.env.API_SECRET_KEY;
 const app = express();
 
 // --- Core Middleware ---
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '10mb', verify: (req, res, buf) => { req.rawBody = buf.toString(); } }));
 app.use(mongoSanitize());
 app.use(hpp());
 app.use(xss());
@@ -45,6 +47,7 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: "Too
 app.use('/api/auth', authLimiter);
 const generalLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 200, message: 'Too many requests.', standardHeaders: true, legacyHeaders: false });
 app.use(['/api/support', '/api/subscriptions', '/api/users', '/api/admin', '/api/feedback', '/api/notifications'], generalLimiter);
+
 
 // --- Mongoose Schemas & Models ---
 const UserSchema = new mongoose.Schema({ refreshToken: { type: String, index: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true }, password: { type: String, required: true }, displayName: { type: String }, isAdmin: { type: Boolean, default: false }, isModemInstalled: { type: Boolean, default: false }, photoUrl: { type: String }, mobileNumber: { type: String }, birthday: { type: String }, gender: { type: String }, address: { type: String }, phase: { type: String }, city: { type: String }, province: { type: String }, zipCode: { type: String }, pushToken: { type: String } }, { timestamps: true });
@@ -91,18 +94,11 @@ const authorize = (role = null) => asyncHandler(async (req, res, next) => {
     }
 });
 
+// --- Multer Configuration ---
 const fileStorage = multer.memoryStorage();
 const fileUpload = multer({
     storage: fileStorage,
     limits: { fileSize: 1024 * 1024 * 5 }, // 5MB limit
-    fileFilter: (req, file, cb) => {
-        // Basic check for image mime types
-        if (file.mimetype.startsWith('image/')) {
-            cb(null, true);
-        } else {
-            cb(new Error('Invalid file type. Only images are allowed.'), false);
-        }
-    }
 });
 
 // --- Validation Schemas ---
@@ -350,6 +346,40 @@ app.post('/api/support/tickets/:id/reply', authorize(), asyncHandler(async (req,
     if (['Resolved', 'Closed'].includes(ticket.status)) ticket.status = 'In Progress';
     const updatedTicket = await ticket.save();
     res.status(201).json(updatedTicket);
+}));
+
+app.get('/api/notifications', authorize(), asyncHandler(async (req, res) => {
+    const notifications = await Notification.find({ userId: req.user.id })
+        .sort({ createdAt: -1 }); // Sort by newest first
+    res.json(notifications);
+}));
+
+// POST /api/notifications/mark-read - Marks one or more notifications as read
+app.post('/api/notifications/mark-read', authorize(), asyncHandler(async (req, res) => {
+    const { ids } = req.body;
+    const query = { userId: req.user.id };
+
+    // If an array of IDs is provided, mark only those as read.
+    // If no IDs are provided, this will mark ALL notifications for the user as read.
+    if (ids && ids.length > 0) {
+        query._id = { $in: ids };
+    }
+    
+    await Notification.updateMany(query, { $set: { read: true } });
+    res.status(200).json({ message: 'Notifications marked as read' });
+}));
+
+// POST /api/notifications/delete - Deletes one or more specified notifications
+app.post('/api/notifications/delete', authorize(), asyncHandler(async (req, res) => {
+    const { ids } = req.body;
+    if (!ids || ids.length === 0) {
+        return res.status(400).json({ message: 'No notification IDs provided' });
+    }
+    
+    // The query ensures users can only delete notifications that belong to them.
+    await Notification.deleteMany({ userId: req.user.id, _id: { $in: ids } });
+    
+    res.status(200).json({ message: 'Notifications deleted' });
 }));
 
 // --- Admin Routes ---
